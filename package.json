@@ -1,0 +1,39 @@
+{
+  "name": "pi-subagents",
+  "version": "0.1.0",
+  "description": "ORGM Pi subagents package.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/osmargm1202/pi-subagents.git"
+  },
+  "bugs": {
+    "url": "https://github.com/osmargm1202/pi-subagents/issues"
+  },
+  "homepage": "https://github.com/osmargm1202/pi-subagents#readme",
+  "keywords": ["pi-package", "pi-extension", "orgm", "subagents"],
+  "files": ["agents", "archive", "extensions", "README.md"],
+  "scripts": {
+    "test": "node --test tests/*.test.ts",
+    "pack:check": "npm pack --dry-run"
+  },
+  "pi": {
+    "extensions": ["./extensions/subagents.ts"],
+    "prompts": ["./agents"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.79.0",
+    "@earendil-works/pi-ai": "^0.79.0",
+    "@earendil-works/pi-coding-agent": "^0.79.0",
+    "@earendil-works/pi-tui": "^0.79.0",
+    "typebox": "^1.0.55"
+  }
+}
