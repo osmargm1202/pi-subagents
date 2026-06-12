@@ -18,6 +18,7 @@ pi install git:github.com/osmargm1202/pi-harness
 
 - Subagent prompt assets in `agents/` and `archive/subagents/`.
 - Subagent discovery/deployment extension from ORGM `pi-harness`.
+- Agent-status widgets/status line and `/orgm-agent-status` inspector.
 - Subagent runtime/model/interaction helper libraries.
 
 ## Development
