@@ -13,10 +13,10 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import {
 	DynamicBorder,
 	getAgentDir,
-	hasProjectTrustInputs,
 	keyHint,
 	ProjectTrustStore,
 } from "@earendil-works/pi-coding-agent";
@@ -177,6 +177,10 @@ function untrackSubagentChild(deploymentId: string): void {
 // ─── Types ──────────────────────────────────────────────────────────────────
 type AgentReuseMode = "prefer" | "require" | "never";
 type SubagentProjectTrustMode = "inherit" | "approve" | "no-approve";
+type PiCodingAgentTrustExports = typeof PiCodingAgent & {
+	hasProjectTrustInputs?: (cwd: string) => boolean;
+	hasTrustRequiringProjectResources?: (cwd: string) => boolean;
+};
 
 interface ProviderStopDetails {
 	deploymentId?: string;
@@ -951,10 +955,17 @@ function applyConfiguredAgentModels(agents: AgentConfig[]): AgentConfig[] {
 	}));
 }
 
+function hasTrustRequiringProjectResourcesCompat(cwd: string): boolean {
+	const trustExports = PiCodingAgent as PiCodingAgentTrustExports;
+	const hasTrustRequiringResources =
+		trustExports.hasTrustRequiringProjectResources ?? trustExports.hasProjectTrustInputs;
+	return hasTrustRequiringResources?.(cwd) ?? false;
+}
+
 function isProjectTrustedForSubagent(cwd: string, mode: SubagentProjectTrustMode): boolean {
 	if (mode === "approve") return true;
 	if (mode === "no-approve") return false;
-	if (!hasProjectTrustInputs(cwd)) return true;
+	if (!hasTrustRequiringProjectResourcesCompat(cwd)) return true;
 	return new ProjectTrustStore(getAgentDir()).get(cwd) === true;
 }
 
