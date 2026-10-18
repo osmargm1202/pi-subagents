@@ -1,9 +1,20 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { after } from "node:test";
 import { discoverDeployableAgents, findDeployableAgent } from "../extensions/lib/agent-discovery.ts";
 
+// Discovery must not depend on the developer's real user-level subagents.
+const userRoot = mkdtempSync(join(tmpdir(), "pi-subagents-user-"));
+const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+process.env.PI_CODING_AGENT_DIR = userRoot;
+after(() => {
+	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	rmSync(userRoot, { recursive: true, force: true });
+	rmSync(projectRoot, { recursive: true, force: true });
+});
 const packageAgents = discoverDeployableAgents(tmpdir(), "user");
 assert.equal(packageAgents.some((agent) => agent.filePath.includes("/assets/subagents/")), false, "package should not expose bundled assets/subagents by default");
 assert.equal(findDeployableAgent(tmpdir(), "tdd-planner", "user"), undefined, "archived package subagents should not be deployable");

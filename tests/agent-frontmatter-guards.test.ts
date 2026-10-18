@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 const repoRoot = process.cwd();
 const agentsRoot = join(repoRoot, "agents");
-const expectedModes = ["ask.md", "build.md", "plan.md", "sdd.md", "tdd.md"];
+const expectedModes = ["ask.md", "build.md", "impeccable.md", "plan.md", "sdd.md", "tdd.md"];
 
 const agentEntries = readdirSync(agentsRoot).sort();
 assert.deepEqual(agentEntries, expectedModes, "agents/ should contain only mode prompt files");

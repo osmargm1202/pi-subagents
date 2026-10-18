@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, SelectList, Text, type SelectItem, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
@@ -19,6 +19,7 @@ import {
 	type DeploymentState,
 	type DeploymentStatus,
 	type DeploymentTranscriptEntry,
+	type DeploymentTranscriptKind,
 	type DeploymentTranscriptMap,
 	type RuntimeSnapshot,
 } from "./lib/subagent-runtime-model.ts";
@@ -185,7 +186,7 @@ export function shouldShowAgentStatusWidget(
 	return true;
 }
 
-function buildWidgetStatus(view: ReturnType<typeof getWidgetViewModel>): { text: string; color: string } {
+function buildWidgetStatus(view: ReturnType<typeof getWidgetViewModel>): { text: string; color: ThemeColor } {
 	const { running, waiting, paused, idle, displayDeployments } = view;
 	const text = running > 0
 		? `🤖 ${running} running${waiting > 0 ? ` · ${waiting} waiting` : ""}${paused > 0 ? ` · ${paused} paused` : ""}${idle > 0 ? ` · ${idle} idle` : ""}`
@@ -325,7 +326,7 @@ function buildInspectOptions(deployments: DeploymentState[]): Array<{ label: str
 }
 
 async function openDeploymentPanel(ctx: ExtensionContext, deployments: DeploymentState[]): Promise<string | null> {
-	if (!ctx.hasUI) return null;
+	if (ctx.mode !== "tui") return null;
 	const options = buildInspectOptions(deployments);
 	if (options.length === 0) {
 		ctx.ui.notify("No subagent deployments available", "warning");
@@ -428,7 +429,7 @@ async function openTranscriptViewer(
 	onOpen: (handle: { requestRender: () => void }) => void,
 	onClose: () => void,
 ): Promise<void> {
-	if (!ctx.hasUI) return;
+	if (ctx.mode !== "tui") return;
 	const WINDOW_LINES = 26;
 	await ctx.ui.custom<void>((tui, theme, _kb, done) => {
 		onOpen(tui);
@@ -599,7 +600,8 @@ export default function (pi: ExtensionAPI) {
 		rerenderWidget();
 	});
 
-	pi.events.on(SUBAGENTS_EVENT, (data: { deployments?: DeploymentState[]; runtimes?: RuntimeSnapshot[]; transcripts?: DeploymentTranscriptMap }) => {
+	const unsubscribe = pi.events.on(SUBAGENTS_EVENT, (value) => {
+		const data = value as { deployments?: DeploymentState[]; runtimes?: RuntimeSnapshot[]; transcripts?: DeploymentTranscriptMap } | undefined;
 		const nextDeployments = Array.isArray(data?.deployments) ? data.deployments.filter((deployment) => deployment.status !== "done") : [];
 		const nextRuntimes: RuntimeSnapshot[] = [];
 		const nextTranscripts = data?.transcripts && typeof data.transcripts === "object"
@@ -615,7 +617,18 @@ export default function (pi: ExtensionAPI) {
 		if (transcriptStateChanged) rerenderTranscriptViewer();
 	});
 
+	pi.on("session_shutdown", () => {
+		unsubscribe();
+		currentCtx = null;
+		widgetHandle = null;
+		transcriptViewerHandle = null;
+	});
+
 	const inspectDeployment = async (ctx: ExtensionContext, deploymentId?: string | null) => {
+		if (ctx.mode !== "tui") {
+			ctx.ui.notify("Subagent inspection requires interactive TUI mode.", "warning");
+			return;
+		}
 		const sessionState = filterSessionState(deployments, runtimes, ctx.sessionManager.getSessionFile());
 		const inspectDeployments = deriveInspectDeployments(sessionState.deployments, sessionState.runtimes);
 		const selectedDeploymentId = deploymentId ?? await openDeploymentPanel(ctx, inspectDeployments);
@@ -703,7 +716,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			lastWidgetStateSignature = "";
 			syncWidget(ctx);
-			ctx.ui.notify("Agent status settings applied", "success");
+			ctx.ui.notify("Agent status settings applied", "info");
 		},
 	});
 }

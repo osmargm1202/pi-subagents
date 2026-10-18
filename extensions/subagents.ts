@@ -1,4 +1,6 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { runSubagentProcess, updateAssistantPreview } from "./lib/subagent-process.ts";
 import {
 	existsSync,
 	mkdirSync,
@@ -7,7 +9,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
@@ -105,7 +107,7 @@ function currentOrgmModeFromEntries(entries: readonly any[] | undefined): Scoped
 	return undefined;
 }
 
-export function isAgentAllowedForOrgmMode(mode: ScopedOrgmModeName | undefined, agent: Pick<AgentConfig, "filePath">): boolean {
+export function isAgentAllowedForOrgmMode(mode: ScopedOrgmModeName | undefined, agent: Pick<AgentConfig, "filePath"> & Partial<AgentConfig>): boolean {
 	if (!mode) return true;
 	if (mode === "sdd" || mode === "tdd") return true;
 	return normalizeAgentPath(agent.filePath).includes(MODE_AGENT_DIRS[mode]);
@@ -123,56 +125,11 @@ const GLOBAL_FALLBACK_MODEL =
 const DEPLOYMENT_GRID_MAX_COLUMNS = 6;
 const DEPLOYMENT_CARD_MIN_WIDTH = 24;
 const DEPLOYMENT_GRID_GAP = 2;
-const SUBAGENT_COMPLETION_STALL_TIMEOUT_MS = 4_000;
-const SUBAGENT_FORCE_KILL_TIMEOUT_MS = 3_000;
 const SUBAGENT_TRANSCRIPT_MAX_LINES = 400;
 const SUBAGENT_DETAILS_TRANSCRIPT_MAX_ENTRIES = 80;
 const SUBAGENT_INLINE_TRANSCRIPT_COLLAPSED_ENTRIES = 3;
 const SUBAGENT_INLINE_TRANSCRIPT_EXPANDED_ENTRIES = 18;
 const SUBAGENT_UI_REFRESH_DEBOUNCE_MS = 120;
-const activeSubagentChildren = new Map<string, ChildProcessWithoutNullStreams>();
-let subagentChildCleanupRegistered = false;
-
-function terminateSubagentProcessTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals = "SIGTERM"): void {
-	if (!child.pid || child.killed) return;
-	try {
-		process.kill(-child.pid, signal);
-		return;
-	} catch {
-		// Fall back to direct child kill when the child is not a process-group leader.
-	}
-	try {
-		child.kill(signal);
-	} catch {
-		// ignore cleanup failures
-	}
-}
-
-function cleanupActiveSubagentChildren(signal: NodeJS.Signals = "SIGTERM"): void {
-	for (const child of activeSubagentChildren.values()) terminateSubagentProcessTree(child, signal);
-}
-
-function registerSubagentChildCleanup(): void {
-	if (subagentChildCleanupRegistered) return;
-	subagentChildCleanupRegistered = true;
-	process.once("exit", () => cleanupActiveSubagentChildren("SIGTERM"));
-	for (const signal of ["SIGINT", "SIGTERM"] as const) {
-		process.once(signal, () => {
-			cleanupActiveSubagentChildren("SIGTERM");
-			setTimeout(() => cleanupActiveSubagentChildren("SIGKILL"), SUBAGENT_FORCE_KILL_TIMEOUT_MS).unref?.();
-			process.exit(signal === "SIGINT" ? 130 : 143);
-		});
-	}
-}
-
-function trackSubagentChild(deploymentId: string, child: ChildProcessWithoutNullStreams): void {
-	registerSubagentChildCleanup();
-	activeSubagentChildren.set(deploymentId, child);
-}
-
-function untrackSubagentChild(deploymentId: string): void {
-	activeSubagentChildren.delete(deploymentId);
-}
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 type AgentReuseMode = "prefer" | "require" | "never";
@@ -859,8 +816,9 @@ function buildSubagentFailureReport(params: {
 async function relayAwaitingUserInput(
 	payload: AwaitingUserInputPayload,
 	ctx: ExtensionContext,
+	signal?: AbortSignal,
 ): Promise<RelayUserResponse> {
-	if (!ctx.hasUI) {
+	if (!ctx.hasUI || signal?.aborted) {
 		return { cancelled: true, raw: { reason: "ui_unavailable" } };
 	}
 	const title = payload.question || "Subagent needs your input";
@@ -886,7 +844,7 @@ async function relayAwaitingUserInput(
 			const selection = await ctx.ui.input(
 				title,
 				`One or more choices, comma separated. Options: ${renderedOptions.join(" | ")}`,
-				{ timeout },
+				{ timeout, signal },
 			);
 			if (selection === undefined) return { cancelled: true };
 			const values = selection
@@ -897,7 +855,7 @@ async function relayAwaitingUserInput(
 				const comment = await ctx.ui.input(
 					"Additional comment (optional)",
 					"",
-					{ timeout },
+					{ timeout, signal },
 				);
 				return {
 					cancelled: false,
@@ -911,11 +869,11 @@ async function relayAwaitingUserInput(
 		const selected = await ctx.ui.select(
 			`${title}\n\n${context}`,
 			renderedOptions,
-			{ timeout },
+			{ timeout, signal },
 		);
 		if (selected === undefined) return { cancelled: true };
 		const comment = payload.allowComment
-			? await ctx.ui.input("Optional comment", "", { timeout })
+			? await ctx.ui.input("Optional comment", "", { timeout, signal })
 			: undefined;
 		return {
 			cancelled: false,
@@ -925,7 +883,7 @@ async function relayAwaitingUserInput(
 		};
 	}
 
-	const answer = await ctx.ui.input(title, context, { timeout });
+	const answer = await ctx.ui.input(title, context, { timeout, signal });
 	if (answer === undefined) return { cancelled: true };
 	return { cancelled: false, selection: answer.trim(), raw: answer };
 }
@@ -983,11 +941,17 @@ function discoverAgents(
 }
 
 // ─── Pi invocation & temp file helpers ──────────────────────────────────────
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	if (currentScript && existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
+export function getPiInvocation(args: string[]): { command: string; args: string[] } {
+	// An SDK host's argv[1] is not necessarily Pi. Resolve the host CLI instead.
+	try {
+		// Pi 1.3.0 exports only the ESM import condition; require.resolve fails.
+		const entry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+		for (const cli of [join(dirname(entry), "bundle", "cli.js"), join(dirname(entry), "cli.js")]) {
+			if (existsSync(cli)) return { command: process.execPath, args: [cli, ...args] };
+		}
+	} catch { /* Compiled Pi may provide mapped imports without a physical CLI. */ }
+	if (!/^(node|bun)(\.exe)?$/i.test(basename(process.execPath)))
+		return { command: process.execPath, args };
 	return { command: "pi", args };
 }
 
@@ -1183,7 +1147,7 @@ function isLikelyRetryableModelFailure(params: {
 	stderr?: string;
 	finalText?: string;
 }): boolean {
-	if (params.stopReason === "abort") return false;
+	if (params.stopReason === "abort" || params.stopReason === "aborted") return false;
 	const haystack = [params.errorMessage, params.stderr, params.finalText]
 		.filter(Boolean)
 		.join("\n")
@@ -1428,6 +1392,8 @@ function renderWidget(
 export default function (pi: ExtensionAPI) {
 	if (!isOrgmExtensionEnabled("subagents")) return;
 
+	const activeRuns = new Map<AbortController, Promise<unknown>>();
+	let shuttingDown = false;
 	let promptDeployments: DeploymentState[] = [];
 	let deploymentCountsByAgent = new Map<string, number>();
 	let deploymentTranscripts = new Map<string, DeploymentTranscriptEntry[]>();
@@ -1456,6 +1422,7 @@ export default function (pi: ExtensionAPI) {
 		});
 	};
 	const refreshUI = (ctx: ExtensionContext, immediate = false) => {
+		if (shuttingDown) return;
 		pendingRefreshCtx = ctx;
 		if (immediate) {
 			if (refreshTimer) {
@@ -1514,7 +1481,17 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		shuttingDown = false;
 		resetPromptDeployments(ctx);
+	});
+
+	pi.on("session_shutdown", async () => {
+		shuttingDown = true;
+		if (refreshTimer) clearTimeout(refreshTimer);
+		refreshTimer = null;
+		pendingRefreshCtx = null;
+		for (const controller of activeRuns.keys()) controller.abort();
+		await Promise.allSettled(activeRuns.values());
 	});
 
 	function buildDeploymentState(params: {
@@ -1531,7 +1508,7 @@ export default function (pi: ExtensionAPI) {
 		ownerSessionFile?: string;
 		parentRuntimeId?: string;
 		depth: number;
-	}): DeploymentState {
+	}): DeploymentState & Required<Pick<DeploymentState, "instanceNumber" | "mode" | "launchBackend" | "reusedRuntime" | "depth">> {
 		const fallbackModel = getFallbackModel(params.agent.model);
 		return {
 			deploymentId: params.deploymentId,
@@ -1714,7 +1691,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		};
 
-		const relayPendingInteractionRequests = async () => {
+		const relayPendingInteractionRequests = async (signal?: AbortSignal) => {
 			if (!interactionBridgeDir || !params.relayUserInput || !params.ctx.hasUI) return;
 			await processPendingSubagentInteractionRequests(interactionBridgeDir, async (request) => {
 				const payload = subagentRequestToAwaitingPayload(request);
@@ -1729,7 +1706,7 @@ export default function (pi: ExtensionAPI) {
 				});
 				refreshUI(params.ctx);
 				emitProgress();
-				const response = await relayAwaitingUserInput(payload, params.ctx);
+				const response = await relayAwaitingUserInput(payload, params.ctx, signal);
 				deployment.status = "running";
 				deployment.currentActivity = "resuming after user input";
 				refreshUI(params.ctx);
@@ -1742,6 +1719,7 @@ export default function (pi: ExtensionAPI) {
 		};
 
 		const runAttempt = async (modelRef: string | undefined) => {
+			let assistantMessageSeen = false;
 			let attemptFinalText = "";
 			let attemptStopReason: string | undefined;
 			let attemptErrorMessage: string | undefined;
@@ -1783,50 +1761,13 @@ export default function (pi: ExtensionAPI) {
 				PI_SUBAGENT_DEPLOYMENT_ID: deployment.deploymentId,
 				...(interactionBridgeDir && params.relayUserInput && params.ctx.hasUI ? { [SUBAGENT_INTERACTION_BRIDGE_ENV]: interactionBridgeDir } : {}),
 			};
-			let stdoutBuffer = "";
-			let settled = false;
-			let aborted = false;
-			let completionEventSeen = false;
-			let completionTerminationTriggered = false;
-			let closeWatchdog: NodeJS.Timeout | undefined;
-			let completionWatchdog: NodeJS.Timeout | undefined;
-			let forceKillWatchdog: NodeJS.Timeout | undefined;
-			let pollInterval: NodeJS.Timeout | undefined;
-			let interactionPollInterval: NodeJS.Timeout | undefined;
-			let forceCompleteAttempt: (() => void) | undefined;
-			let stdoutOffset = 0;
-			let stderrOffset = 0;
-			const clearWatchdogs = () => {
-				if (closeWatchdog) clearTimeout(closeWatchdog);
-				if (completionWatchdog) clearTimeout(completionWatchdog);
-				if (forceKillWatchdog) clearTimeout(forceKillWatchdog);
-				if (pollInterval) clearInterval(pollInterval);
-				if (interactionPollInterval) clearInterval(interactionPollInterval);
-			};
-			const resolveExitCode = (code: number | null | undefined): number => {
-				if (
-					completionEventSeen &&
-					completionTerminationTriggered &&
-					!attemptErrorMessage
-				)
-					return 0;
-				if (typeof code === "number") return code;
-				if (aborted) return 1;
-				if (completionEventSeen && !attemptErrorMessage) return 0;
-				return 1;
-			};
-			const parseLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
+			const previewBlocks = new Map<number, string>();
+			const parseEvent = (event: any) => {
 				if (
 					event.type === "message_start" &&
 					event.message?.role === "assistant"
 				) {
+					previewBlocks.clear();
 					deployment.currentActivity = "thinking...";
 					appendTranscript(params.ctx, deployment.deploymentId, {
 						kind: "thinking",
@@ -1840,7 +1781,7 @@ export default function (pi: ExtensionAPI) {
 					deployment.status === "running"
 				) {
 					deployment.currentActivity = "thinking...";
-					const preview = extractAssistantText(event.message);
+					const preview = updateAssistantPreview(previewBlocks, event);
 					if (preview) {
 						const clipped = previewTranscriptText(preview, 6, 700);
 						if (clipped && clipped !== lastAssistantPreview) {
@@ -1878,6 +1819,7 @@ export default function (pi: ExtensionAPI) {
 					event.type === "message_end" &&
 					event.message?.role === "assistant"
 				) {
+					assistantMessageSeen = true;
 					const text = extractAssistantText(event.message);
 					if (text) {
 						attemptFinalText = text;
@@ -1928,13 +1870,12 @@ export default function (pi: ExtensionAPI) {
 							lastAssistant.usage.totalTokens || deployment.usage.contextTokens;
 						deployment.contextTokens = deployment.usage.contextTokens;
 					}
-					attemptStopReason = lastAssistant?.stopReason ?? attemptStopReason;
-					attemptErrorMessage =
-						lastAssistant?.errorMessage ?? attemptErrorMessage;
+					if (lastAssistant) {
+						attemptStopReason = lastAssistant.stopReason;
+						attemptErrorMessage = lastAssistant.errorMessage;
+					}
 					stopReason = attemptStopReason;
 					errorMessage = attemptErrorMessage;
-					completionEventSeen =
-						!attemptErrorMessage && attemptStopReason !== "error";
 					appendTranscript(params.ctx, deployment.deploymentId, {
 						kind: "status",
 						title: `Agent end · stopReason=${attemptStopReason ?? "unknown"}`,
@@ -1942,7 +1883,6 @@ export default function (pi: ExtensionAPI) {
 					});
 					refreshUI(params.ctx);
 					emitProgress();
-					if (completionEventSeen) armCompletionWatchdog();
 				}
 				if (
 					event.type === "tool_execution_end" &&
@@ -2004,206 +1944,47 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 			};
-			const flushStdoutBuffer = () => {
-				if (stdoutBuffer.trim()) parseLine(stdoutBuffer);
-				stdoutBuffer = "";
-			};
-			const armCompletionWatchdog = () => {
-				if (!completionEventSeen || settled || aborted) return;
-				if (completionWatchdog) clearTimeout(completionWatchdog);
-				completionWatchdog = setTimeout(() => {
-					if (settled || aborted) return;
-					completionTerminationTriggered = true;
-					deployment.summary = truncate(
-						`${deployment.summary || "final response received"} (forcing completion)`,
-					);
-					refreshUI(params.ctx);
-					emitProgress();
-					forceCompleteAttempt?.();
-				}, SUBAGENT_COMPLETION_STALL_TIMEOUT_MS);
-				completionWatchdog.unref?.();
-			};
-			const readIncremental = (
-				filePath: string,
-				offset: number,
-			): { text: string; nextOffset: number } => {
-				if (!existsSync(filePath)) return { text: "", nextOffset: offset };
-				const content = readFileSync(filePath, "utf8");
-				if (content.length <= offset) return { text: "", nextOffset: offset };
-				return { text: content.slice(offset), nextOffset: content.length };
-			};
-			attemptExitCode = await new Promise<number>((resolve) => {
-				const finalize = (code: number) => {
-					if (settled) return;
-					settled = true;
-					untrackSubagentChild(deployment.deploymentId);
-					clearWatchdogs();
-					flushStdoutBuffer();
-					if (aborted) {
-						deployment.summary = "aborted";
-						deployment.currentActivity = "aborted";
-					}
-					if (completionTerminationTriggered && !aborted && code === 0)
-						deployment.summary = truncate(
-							attemptFinalText || deployment.summary || "completed",
-						);
-					resolve(code);
-				};
-				forceCompleteAttempt = () => finalize(0);
-				if (false) {
-					const logDir = ensureDir(
-						join(
-							tmpdir(),
-							"pi-subagent-logs",
-							`${deployment.runtimeId || sanitizeFileLabel(deployment.deploymentId)}-logs`,
-						),
-					);
-					const stdoutPath = join(logDir, "stdout.jsonl");
-					const stderrPath = join(logDir, "stderr.log");
-					const exitPath = join(logDir, "exit.code");
-					const envPrefix = buildShellEnvPrefix(env);
-					const shellCommand = `${envPrefix} bash -lc ${shellEscape(`${shellEscape(invocation.command)} ${invocation.args.map(shellEscape).join(" ")} > ${shellEscape(stdoutPath)} 2> ${shellEscape(stderrPath)}; code=$?; printf '%s\n' "$code" > ${shellEscape(exitPath)}`)}`;
-					createTmuxPane({ cwd: params.cwd, command: shellCommand })
-						.then(({ paneId, windowId }) => {
-							deployment.currentActivity = `running in ${paneId}`;
-							deployment.summary = `running in tmux pane ${paneId}`;
-							refreshUI(params.ctx);
-							emitProgress();
-							pollInterval = setInterval(() => {
-								const stdoutRead = readIncremental(stdoutPath, stdoutOffset);
-								stdoutOffset = stdoutRead.nextOffset;
-								if (stdoutRead.text) {
-									stdoutBuffer += stdoutRead.text;
-									const lines = stdoutBuffer.split("\n");
-									stdoutBuffer = lines.pop() || "";
-									for (const line of lines) parseLine(line);
-									if (completionEventSeen) armCompletionWatchdog();
-								}
-								const stderrRead = readIncremental(stderrPath, stderrOffset);
-								stderrOffset = stderrRead.nextOffset;
-								if (stderrRead.text) {
-									attemptStderr += stderrRead.text;
-									appendTranscript(params.ctx, deployment.deploymentId, {
-										kind: "stderr",
-										title: "stderr",
-										text: previewTranscriptText(stderrRead.text, 10, 1200),
-										ts: Date.now(),
-									});
-								}
-								if (existsSync(exitPath)) {
-									const code = Number.parseInt(
-										readFileSync(exitPath, "utf8").trim() || "1",
-										10,
-									);
-									finalize(resolveExitCode(Number.isFinite(code) ? code : 1));
-								}
-							}, 250);
-							pollInterval.unref?.();
-						})
+			let interactionPollInterval: ReturnType<typeof setInterval> | undefined;
+			let interactionWork: Promise<void> | undefined;
+			const interactionAbort = new AbortController();
+			const interactionSignal = params.signal
+				? AbortSignal.any([params.signal, interactionAbort.signal]) : interactionAbort.signal;
+			if (interactionBridgeDir && params.relayUserInput && params.ctx.hasUI) {
+				interactionPollInterval = setInterval(() => {
+					if (interactionWork) return;
+					interactionWork = relayPendingInteractionRequests(interactionSignal)
 						.catch((error) => {
-							attemptErrorMessage = getErrorMessage(error);
-							attemptStderr = attemptErrorMessage;
 							appendTranscript(params.ctx, deployment.deploymentId, {
-								kind: "error",
-								title: "tmux launch error",
-								text: attemptErrorMessage,
-								ts: Date.now(),
+								kind: "error", title: "Interaction bridge error", text: getErrorMessage(error), ts: Date.now(),
 							});
-							finalize(1);
+						}).finally(() => { interactionWork = undefined; });
+				}, 100);
+			}
+			try {
+				const result = await runSubagentProcess({
+					...invocation, cwd: params.cwd, env, signal: params.signal,
+					onEvent: parseEvent,
+					onStderr: (text) => {
+						attemptStderr += text;
+						appendTranscript(params.ctx, deployment.deploymentId, {
+							kind: "stderr", title: "stderr",
+							text: previewTranscriptText(text, 10, 1200), ts: Date.now(),
 						});
-					if (params.signal?.aborted) aborted = true;
-					else
-						params.signal?.addEventListener(
-							"abort",
-							() => {
-								aborted = true;
-							},
-							{ once: true },
-						);
-					return;
-				}
-				const child = spawn(invocation.command, invocation.args, {
-					cwd: params.cwd,
-					env,
-					stdio: ["ignore", "pipe", "pipe"],
-					shell: false,
-					detached: true,
+					},
 				});
-				trackSubagentChild(deployment.deploymentId, child);
-				if (interactionBridgeDir && params.relayUserInput && params.ctx.hasUI) {
-					interactionPollInterval = setInterval(() => {
-						void relayPendingInteractionRequests().catch((error) => {
-							appendTranscript(params.ctx, deployment.deploymentId, {
-								kind: "error",
-								title: "Interaction bridge error",
-								text: getErrorMessage(error),
-								ts: Date.now(),
-							});
-						});
-					}, 100);
-					interactionPollInterval.unref?.();
-				}
-				let childClosed = false;
-				let terminationRequested = false;
-				const terminateChild = (reason: "abort" | "completion") => {
-					if (childClosed || terminationRequested) return;
-					terminationRequested = true;
-					if (reason === "abort") aborted = true;
-					terminateSubagentProcessTree(child, "SIGTERM");
-					forceKillWatchdog = setTimeout(() => {
-						if (!childClosed) {
-							terminateSubagentProcessTree(child, "SIGKILL");
-						}
-					}, SUBAGENT_FORCE_KILL_TIMEOUT_MS);
-					forceKillWatchdog.unref?.();
-				};
-				forceCompleteAttempt = () => terminateChild("completion");
-				const abortChild = () => terminateChild("abort");
-				child.stdout.on("data", (chunk) => {
-					stdoutBuffer += chunk.toString();
-					const lines = stdoutBuffer.split("\n");
-					stdoutBuffer = lines.pop() || "";
-					for (const line of lines) parseLine(line);
-					if (completionEventSeen) armCompletionWatchdog();
-				});
-				child.stderr.on("data", (chunk) => {
-					attemptStderr += chunk.toString();
-					appendTranscript(params.ctx, deployment.deploymentId, {
-						kind: "stderr",
-						title: "stderr",
-						text: previewTranscriptText(chunk.toString(), 10, 1200),
-						ts: Date.now(),
-					});
-					if (completionEventSeen) armCompletionWatchdog();
-				});
-				child.once("close", (code) => {
-					childClosed = true;
-					untrackSubagentChild(deployment.deploymentId);
-					finalize(resolveExitCode(code));
-				});
-				child.once("exit", (code) => {
-					closeWatchdog = setTimeout(() => {
-						childClosed = true;
-						finalize(resolveExitCode(code));
-					}, 1_000);
-					closeWatchdog.unref?.();
-				});
-				child.once("error", (error) => {
-					untrackSubagentChild(deployment.deploymentId);
-					attemptErrorMessage = error.message;
-					appendTranscript(params.ctx, deployment.deploymentId, {
-						kind: "error",
-						title: "Spawn error",
-						text: error.message,
-						ts: Date.now(),
-					});
-					childClosed = true;
-					finalize(1);
-				});
-				if (params.signal?.aborted) abortChild();
-				else
-					params.signal?.addEventListener("abort", abortChild, { once: true });
-			});
+				attemptExitCode = result.exitCode;
+				attemptErrorMessage = result.errorMessage ?? attemptErrorMessage;
+				if (!assistantMessageSeen && !result.aborted && !attemptErrorMessage)
+					attemptErrorMessage = attemptStderr.trim() || "Subagent exited without a completed assistant message.";
+				if (result.aborted) attemptStopReason = "aborted";
+				// JSON mode exits zero even for failed assistant messages.
+				if (["error", "aborted", "length"].includes(attemptStopReason ?? "") || attemptErrorMessage)
+					attemptExitCode = 1;
+			} finally {
+				if (interactionPollInterval) clearInterval(interactionPollInterval);
+				interactionAbort.abort();
+				await interactionWork;
+			}
 			appendTranscript(params.ctx, deployment.deploymentId, {
 				kind: "status",
 				title: `Attempt exit ${attemptExitCode}`,
@@ -2239,6 +2020,7 @@ export default function (pi: ExtensionAPI) {
 				exitCode = attempt.exitCode;
 
 				const shouldRetryWithFallback =
+					!params.signal?.aborted &&
 					Boolean(deployment.fallbackModel) &&
 					exitCode !== 0 &&
 					isLikelyRetryableModelFailure({
@@ -2293,6 +2075,7 @@ export default function (pi: ExtensionAPI) {
 					userResponse = await relayAwaitingUserInput(
 						questionPayload,
 						params.ctx,
+						params.signal,
 					);
 					if (userResponse.cancelled) {
 						interactionOutcome = "awaiting_user_input_cancelled";
@@ -2554,7 +2337,7 @@ ${finalText}`
 					details: { requestedAgent: params.agent, availableAgents: available },
 				};
 			}
-			const currentOrgmMode = currentOrgmModeFromEntries(ctx.sessionManager?.getEntries?.());
+			const currentOrgmMode = currentOrgmModeFromEntries(ctx.sessionManager.getBranch());
 			if (!isAgentAllowedForOrgmMode(currentOrgmMode, agent)) {
 				const text = buildModeAgentScopeError(currentOrgmMode!, agent);
 				return {
@@ -2570,16 +2353,18 @@ ${finalText}`
 			if (signal?.aborted) forwardAbort();
 			else signal?.addEventListener("abort", forwardAbort, { once: true });
 			let providerStopDetails: ProviderStopDetails | undefined;
-			const onProviderStop = (data: ProviderStopDetails) => {
-				if (providerStopDetails) return;
+			const onProviderStop = (value: unknown) => {
+				const data = value as ProviderStopDetails | undefined;
+				if (!data || data.deploymentId !== `${agent.name}#${instanceNumber}` || providerStopDetails) return;
 				providerStopDetails = data;
 				localAbort.abort(
 					new Error(data?.summary || "provider error from subagent"),
 				);
 			};
-			pi.events.on(SUBAGENT_PROVIDER_STOP_EVENT, onProviderStop);
+			const unsubscribeProviderStop = pi.events.on(SUBAGENT_PROVIDER_STOP_EVENT, onProviderStop);
 			try {
-				const run = await runAgentTask({
+				if (shuttingDown || localAbort.signal.aborted) throw new Error("deploy_agent aborted");
+				const runPromise = runAgentTask({
 					agent,
 					task: params.task,
 					deploymentId: `${agent.name}#${instanceNumber}`,
@@ -2599,6 +2384,8 @@ ${finalText}`
 					ctx,
 					relayUserInput: true,
 				});
+				activeRuns.set(localAbort, runPromise);
+				const run = await runPromise;
 				if (providerStopDetails) {
 					return {
 						content: [
@@ -2614,6 +2401,12 @@ ${finalText}`
 				return {
 					content: [{ type: "text", text: buildAgentContentText(run.details) }],
 					isError: run.isError,
+					usage: {
+						input: run.details.usage.input, output: run.details.usage.output,
+						cacheRead: run.details.usage.cacheRead, cacheWrite: run.details.usage.cacheWrite,
+						totalTokens: run.details.usage.input + run.details.usage.output + run.details.usage.cacheRead + run.details.usage.cacheWrite,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: run.details.usage.cost },
+					},
 					details: run.details,
 				};
 			} catch (error) {
@@ -2640,7 +2433,8 @@ ${finalText}`
 				};
 			} finally {
 				signal?.removeEventListener("abort", forwardAbort);
-				pi.events.off?.(SUBAGENT_PROVIDER_STOP_EVENT, onProviderStop);
+				unsubscribeProviderStop();
+				activeRuns.delete(localAbort);
 			}
 		},
 

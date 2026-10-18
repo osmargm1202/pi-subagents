@@ -16,5 +16,5 @@ assert.match(source, /args\.push\("--approve"\)/, "deploy_agent should pass --ap
 assert.match(source, /args\.push\("--no-approve"\)/, "deploy_agent should pass --no-approve to child pi when project trust is denied");
 assert.match(source, /findDeployableAgent\(runtimeCwd, params\.agent, scope, \{ projectTrusted/, "deploy_agent should gate project-local subagent discovery by resolved trust");
 assert.match(source, /PI_SUBAGENT_DEPLOYMENT_ID/, "subagent children should be marked with a deployment id for diagnostics");
-assert.match(source, /terminateSubagentProcessTree/, "subagent runner should terminate child process trees, not only direct children");
-assert.match(source, /registerSubagentChildCleanup/, "subagent runner should register process-exit cleanup for active children");
+// Process-group termination and parent-exit cleanup are exercised with real
+// subprocesses in subagent-process.test.ts, rather than matching helper names.
